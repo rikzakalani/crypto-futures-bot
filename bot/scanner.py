@@ -2,6 +2,8 @@ import pandas as pd
 import mplfinance as mpf
 import asyncio, os
 from datetime import datetime
+from telegram import Update
+from telegram.ext import ContextTypes
 
 from config import *
 from exchange import exchange, SYMBOLS
@@ -56,7 +58,7 @@ async def send_chart(app, symbol, change, tf):
         type="candle",
         volume=True,
         addplot=apds,
-        figsize=(8, 5),
+        figsize=(8,5),
         savefig=dict(fname=fname, dpi=120)
     )
 
@@ -71,6 +73,35 @@ async def send_chart(app, symbol, change, tf):
         await app.bot.send_photo(chat_id=TARGET, photo=img, caption=caption)
 
     os.remove(fname)
+
+# ===== COMMANDS =====
+async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tf = context.args[0] if context.args and context.args[0] in TF_MAP else "15m"
+    await update.message.reply_text(f"🔍 Scan manual TF {tf.upper()}")
+
+    for _, r in get_top_movers().iterrows():
+        await send_chart(context.application, r.symbol, r.change, tf)
+        await asyncio.sleep(SEND_DELAY)
+
+async def autostart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_SCAN, AUTO_TF, AUTO_INTERVAL
+
+    if not context.args or context.args[0] not in TF_MAP:
+        await update.message.reply_text("Gunakan: /autostart 5m|15m|1h")
+        return
+
+    AUTO_TF = context.args[0]
+    AUTO_INTERVAL = TF_MAP[AUTO_TF]
+    AUTO_SCAN = True
+
+    await update.message.reply_text(
+        f"🟢 Auto scan aktif\nTF: {AUTO_TF.upper()}"
+    )
+
+async def autostop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_SCAN
+    AUTO_SCAN = False
+    await update.message.reply_text("🔴 Auto scan dihentikan")
 
 async def scanner_loop(app):
     await asyncio.sleep(5)
