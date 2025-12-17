@@ -6,11 +6,9 @@ TARGET = os.getenv("TARGET")
 if not BOT_TOKEN or not TARGET:
     raise RuntimeError("BOT_TOKEN atau TARGET belum diset")
 
-# === GLOBAL ===
 LIMIT = 200
-SEND_DELAY = 5   # aman untuk VPS kecil
+SEND_DELAY = 5
 
-# === SCANNER ===
 TOP_N = 5
 MIN_MOVE_PCT = 3
 
@@ -21,6 +19,5 @@ TF_MAP = {
     "1d": 86400
 }
 
-# === SIGNAL ===
 TF_SIGNAL = "15m"
 SIGNAL_COOLDOWN = 900
