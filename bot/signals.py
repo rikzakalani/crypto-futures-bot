@@ -1,5 +1,8 @@
 import pandas as pd
 import asyncio, time
+from telegram import Update
+from telegram.ext import ContextTypes
+
 from config import *
 from exchange import exchange, symbol_available
 
@@ -24,6 +27,58 @@ def check_signal(df):
     if last.ema9 < last.ema26 < last.ema50 < last.ema200:
         return "SELL"
     return None
+
+# ===== COMMANDS =====
+async def signalmonitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MONITOR_ON, MONITOR_MODE, MONITOR_SYMBOL
+
+    if not context.args:
+        await update.message.reply_text("Gunakan: /signalmonitor on|off|btc")
+        return
+
+    arg = context.args[0].lower()
+
+    if arg == "on":
+        MONITOR_ON = True
+        MONITOR_MODE = "ALL"
+        MONITOR_SYMBOL = None
+        await update.message.reply_text("🟢 Signal monitor aktif (ALL)")
+        return
+
+    if arg == "off":
+        MONITOR_ON = False
+        await update.message.reply_text("🔴 Signal monitor dihentikan")
+        return
+
+    symbol = f"{arg.upper()}/USDT:USDT"
+    if not symbol_available(symbol):
+        await update.message.reply_text("⛔ Symbol tidak tersedia")
+        return
+
+    MONITOR_ON = True
+    MONITOR_MODE = "SINGLE"
+    MONITOR_SYMBOL = symbol
+
+    await update.message.reply_text(f"🟢 Signal monitor aktif\n{symbol}")
+
+async def listcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📌 WATCHLIST:\n" + "\n".join(WATCHLIST))
+
+async def addcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return
+    symbol = f"{context.args[0].upper()}/USDT:USDT"
+    if symbol not in WATCHLIST:
+        WATCHLIST.append(symbol)
+    await update.message.reply_text(f"✅ Ditambahkan: {symbol}")
+
+async def delcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return
+    symbol = f"{context.args[0].upper()}/USDT:USDT"
+    if symbol in WATCHLIST:
+        WATCHLIST.remove(symbol)
+    await update.message.reply_text(f"🗑️ Dihapus: {symbol}")
 
 async def monitor_loop(app):
     await asyncio.sleep(5)
