@@ -1,3 +1,5 @@
+import pandas as pd
+
 def calc_support_resistance(df, window=20):
     supports, resistances = [], []
 
