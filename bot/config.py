@@ -3,13 +3,10 @@ import os
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET = os.getenv("TARGET")
 
-if not BOT_TOKEN or not TARGET:
-    raise RuntimeError("BOT_TOKEN atau TARGET belum diset")
-
+# === SCANNER CONFIG ===
+TOP_N = 10
+SEND_DELAY = 3
 LIMIT = 200
-SEND_DELAY = 5
-
-TOP_N = 5
 MIN_MOVE_PCT = 3
 
 TF_MAP = {
@@ -19,5 +16,10 @@ TF_MAP = {
     "1d": 86400
 }
 
-TF_SIGNAL = "15m"
+# === SIGNAL CONFIG ===
+SIGNAL_TF = "15m"
+SIGNAL_INTERVAL = 900
 SIGNAL_COOLDOWN = 900
+
+if not BOT_TOKEN or not TARGET:
+    raise ValueError("BOT_TOKEN atau TARGET belum diset")
