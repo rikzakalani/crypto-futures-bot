@@ -12,5 +12,5 @@ SYMBOLS = [
     if s.endswith(":USDT") and markets[s].get("swap")
 ]
 
-def symbol_available(symbol: str) -> bool:
+def symbol_available(symbol):
     return symbol in markets and markets[symbol].get("swap")
