@@ -1,5 +1,5 @@
 # =================================================
-# EMA TOUCH SIGNAL BOT - FINAL HARDENED
+# EMA TOUCH SIGNAL BOT - FINAL FIX (AUDITED)
 # Exchange : MEXC Futures (SWAP)
 # TF       : 5m
 # =================================================
@@ -21,16 +21,33 @@ from telegram.ext import (
 from datetime import datetime, timezone
 import asyncio
 import os
+import logging
+
+# ================= LOGGING =================
+LOG_FORMAT = "%(asctime)s | %(levelname)-5s | %(message)s"
+logging.basicConfig(
+    level=logging.INFO,
+    format=LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger("EMA-TOUCH")
 
 # ================= CONFIG =================
-BOT_TOKEN = os.getenv("8037827696:AAHodY7-aQNg9l6v21zISnxFxazxK5I0TL8") or "8037827696:AAHodY7-aQNg9l6v21zISnxFxazxK5I0TL8"
-TARGET = int(os.getenv("8037827696") or 8037827696)  # 🔥 HARUS INT
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TARGET = int(os.getenv("TARGET", "0"))
+
+if not BOT_TOKEN or TARGET == 0:
+    logger.error("ENV BOT_TOKEN / TARGET belum diset")
+    exit(1)
 
 TF = "5m"
 FETCH_LIMIT = 260
 PLOT_CANDLE = 120
 SEND_DELAY = 2
-SIGNAL_COOLDOWN = 300  # per EMA
+SIGNAL_COOLDOWN = 300
 
 EMA_FAST = 150
 EMA_SLOW = 200
@@ -53,8 +70,9 @@ exchange = ccxt.mexc({
 
 try:
     exchange.load_markets()
+    logger.info("Market loaded")
 except Exception as e:
-    print("[FATAL] Load markets failed:", e)
+    logger.error(f"Load market failed: {e}")
     exit(1)
 
 def symbol_available(symbol):
@@ -62,11 +80,11 @@ def symbol_available(symbol):
 
 # ================= SAFE FETCH ==============
 async def safe_fetch(symbol):
-    for _ in range(3):
+    for i in range(3):
         try:
             return exchange.fetch_ohlcv(symbol, TF, limit=FETCH_LIMIT)
         except Exception as e:
-            print(f"[FETCH ERROR] {symbol}: {e}")
+            logger.warning(f"Fetch {symbol} retry {i+1}: {e}")
             await asyncio.sleep(2)
     return None
 
@@ -78,14 +96,11 @@ def calc_ema(df):
 
 # ================= TOUCH LOGIC =============
 def ema_touch(df):
-    last = df.iloc[-2]  # 🔥 candle CLOSED
-
+    last = df.iloc[-2]  # CLOSED candle
     if last.low <= last.ema150 <= last.high:
         return "EMA150"
-
     if last.low <= last.ema200 <= last.high:
         return "EMA200"
-
     return None
 
 # ================= SEND SIGNAL =============
@@ -97,6 +112,7 @@ async def send_signal(app, symbol, ema_type, df):
         return
 
     LAST_SIGNAL[key] = now
+    logger.info(f"SIGNAL {symbol} {ema_type}")
 
     fname = symbol.replace("/", "").replace(":", "") + ".png"
     plot_df = df.iloc[-PLOT_CANDLE-1:-1]
@@ -104,7 +120,6 @@ async def send_signal(app, symbol, ema_type, df):
     mpf.plot(
         plot_df,
         type="candle",
-        style="charles",
         volume=True,
         addplot=[
             mpf.make_addplot(plot_df["ema150"]),
@@ -113,32 +128,26 @@ async def send_signal(app, symbol, ema_type, df):
         savefig=dict(fname=fname, dpi=130)
     )
 
-    caption = (
-        f"🚨 *EMA TOUCH SIGNAL*\n"
-        f"📊 {symbol}\n"
-        f"📌 {ema_type} TOUCH (CLOSED)\n"
-        f"⏱ TF: 5m\n"
-        f"🕒 {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
-    )
-
     try:
         with open(fname, "rb") as img:
             await app.bot.send_photo(
                 chat_id=TARGET,
                 photo=img,
-                caption=caption,
-                parse_mode="Markdown"
+                caption=(
+                    f"🚨 EMA TOUCH SIGNAL\n"
+                    f"{symbol}\n"
+                    f"{ema_type} | TF 5m"
+                )
             )
-        print(f"[SIGNAL] {symbol} {ema_type}")
     except Exception as e:
-        print("[TELEGRAM ERROR]", e)
+        logger.error(f"Telegram send error: {e}")
     finally:
         if os.path.exists(fname):
             os.remove(fname)
 
 # ================= LOOP ====================
 async def monitor_loop(app):
-    print("[MONITOR] LOOP STARTED")
+    logger.info("Monitor loop started")
     while True:
         if not MONITOR_ON or not WATCHLIST:
             await asyncio.sleep(5)
@@ -165,32 +174,36 @@ async def monitor_loop(app):
 
                 if signal:
                     await send_signal(app, sym, signal, df)
+                else:
+                    logger.info(f"NO SIGNAL {sym}")
 
                 await asyncio.sleep(SEND_DELAY)
 
             except Exception as e:
-                print(f"[MONITOR ERROR] {sym}: {e}")
+                logger.error(f"Monitor error {sym}: {e}")
 
 # ================= COMMANDS ================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("CMD /start")
     await update.message.reply_text(
-        "🤖 *EMA TOUCH BOT*\n\n"
+        "🤖 EMA TOUCH BOT\n"
         "/on /off\n"
         "/addcoin btc\n"
         "/delcoin btc\n"
         "/listcoin\n"
-        "/status",
-        parse_mode="Markdown"
+        "/status"
     )
 
 async def on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MONITOR_ON
     MONITOR_ON = True
+    logger.info("Monitor ON")
     await update.message.reply_text("🟢 Monitor ON")
 
 async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MONITOR_ON
     MONITOR_ON = False
+    logger.info("Monitor OFF")
     await update.message.reply_text("🔴 Monitor OFF")
 
 async def addcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,6 +212,7 @@ async def addcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sym = f"{context.args[0].upper()}/USDT:USDT"
     if symbol_available(sym) and sym not in WATCHLIST:
         WATCHLIST.append(sym)
+        logger.info(f"ADD {sym}")
         await update.message.reply_text(f"✅ {sym} added")
 
 async def delcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,6 +221,7 @@ async def delcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sym = f"{context.args[0].upper()}/USDT:USDT"
     if sym in WATCHLIST:
         WATCHLIST.remove(sym)
+        logger.info(f"DEL {sym}")
         await update.message.reply_text(f"🗑️ {sym} removed")
 
 async def listcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,8 +235,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= INIT ====================
 async def post_init(app: Application):
     global MONITOR_TASK
-    if not MONITOR_TASK:
-        MONITOR_TASK = app.create_task(monitor_loop(app))
+    MONITOR_TASK = app.create_task(monitor_loop(app))
 
 def main():
     app = (
@@ -239,7 +253,7 @@ def main():
     app.add_handler(CommandHandler("listcoin", listcoin))
     app.add_handler(CommandHandler("status", status))
 
-    print("✅ EMA TOUCH BOT RUNNING (HARDENED)")
+    logger.info("EMA TOUCH BOT RUNNING (FINAL FIX)")
     app.run_polling(stop_signals=None)
 
 if __name__ == "__main__":
