@@ -1,5 +1,5 @@
 # =================================================
-# EMA TOUCH SCANNER BOT - MEXC PRO FIX FINAL
+# EMA TOUCH SCANNER BOT - MEXC PRO (FIX FINAL)
 # Mode     : MANUAL SCANNER
 # TF       : 5m
 # Volume   : TOP 100 (Batch 50 + Delay)
@@ -24,10 +24,6 @@ from datetime import datetime, timezone
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("scanner.log", encoding="utf-8")
-    ]
 )
 log = logging.getLogger("EMA-SCANNER")
 
@@ -35,29 +31,33 @@ log = logging.getLogger("EMA-SCANNER")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TARGET = int(os.getenv("TARGET", "0"))
 
-if not BOT_TOKEN or TARGET == 0:
-    log.error("BOT_TOKEN / TARGET belum diset")
-    exit(1)
-
 TF = "5m"
 FETCH_LIMIT = 300
 
 EMA_FAST = 150
 EMA_SLOW = 200
-EMA_SMOOTH = 9
-TOLERANCE_PCT = 0.0003
+TOLERANCE_PCT = 0.001  # ✅ 0.1% (ideal scalping)
 
 TOP_N = 100
 BATCH_SIZE = 50
-DELAY_BETWEEN_BATCH = 30   # detik
-DELAY_PER_SYMBOL = 1       # detik
+DELAY_BETWEEN_BATCH = 30
+DELAY_PER_SYMBOL = 1
 
 # ================= EXCHANGE ===============
 exchange = ccxt.mexc({
     "enableRateLimit": True,
     "options": {"defaultType": "swap"}
 })
-exchange.load_markets()
+
+MARKETS_LOADED = False
+
+async def ensure_markets():
+    global MARKETS_LOADED
+    if not MARKETS_LOADED:
+        await asyncio.get_running_loop().run_in_executor(
+            None, exchange.load_markets
+        )
+        MARKETS_LOADED = True
 
 # ================= SAFE FETCH =============
 async def safe_fetch(symbol):
@@ -74,35 +74,37 @@ async def safe_fetch(symbol):
     return None
 
 # ================= EMA ====================
-def mexc_ema(series, length, smooth):
-    ema = series.ewm(span=length, adjust=False).mean()
-    return ema.rolling(smooth).mean()
-
 def calc_ema(df):
-    df["ema150"] = mexc_ema(df["close"], EMA_FAST, EMA_SMOOTH)
-    df["ema200"] = mexc_ema(df["close"], EMA_SLOW, EMA_SMOOTH)
+    df["ema150"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
     return df
 
 # ================= TOP VOLUME =============
 def get_top_volume_symbols(n):
-    tickers = exchange.fetch_tickers()
-    sorted_symbols = sorted(
-        tickers.items(),
-        key=lambda x: x[1]["quoteVolume"] or 0,
-        reverse=True
-    )
-    return [
-        s for s, _ in sorted_symbols
-        if s.endswith("/USDT:USDT")
-        and exchange.markets[s].get("swap")
-    ][:n]
+    try:
+        tickers = exchange.fetch_tickers()
+    except Exception as e:
+        log.error(f"fetch_tickers error: {e}")
+        return []
+
+    symbols = []
+    for s, t in tickers.items():
+        if (
+            s.endswith("/USDT:USDT")
+            and t
+            and t.get("quoteVolume")
+        ):
+            symbols.append((s, t["quoteVolume"]))
+
+    symbols.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in symbols[:n]]
 
 # ================= SCAN CORE ==============
 async def scan_batch(symbols, batch_no):
     ema150, ema200 = [], []
 
     for idx, sym in enumerate(symbols, 1):
-        log.info(f"[Batch {batch_no}] Scanning {sym} ({idx}/{len(symbols)})")
+        log.info(f"[Batch {batch_no}] {sym} ({idx}/{len(symbols)})")
 
         ohlcv = await safe_fetch(sym)
         if not ohlcv:
@@ -115,19 +117,18 @@ async def scan_batch(symbols, batch_no):
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         df.set_index("time", inplace=True)
 
-        if len(df) < EMA_SLOW + EMA_SMOOTH + 2:
+        if len(df) < EMA_SLOW + 2:
             continue
 
         df = calc_ema(df)
-        c = df.iloc[-2]  # CLOSED candle
-
+        c = df.iloc[-2]  # closed candle
         tol = c.close * TOLERANCE_PCT
         base = sym.split("/")[0]
 
-        if abs(c.low - c.ema150) <= tol or abs(c.high - c.ema150) <= tol:
+        if c.low - tol <= c.ema150 <= c.high + tol:
             ema150.append(base)
 
-        if abs(c.low - c.ema200) <= tol or abs(c.high - c.ema200) <= tol:
+        if c.low - tol <= c.ema200 <= c.high + tol:
             ema200.append(base)
 
         await asyncio.sleep(DELAY_PER_SYMBOL)
@@ -135,61 +136,48 @@ async def scan_batch(symbols, batch_no):
     return ema150, ema200
 
 # ================= COMMANDS ===============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 EMA TOUCH SCANNER (MEXC)\n\n"
-        "/scan   → Scan TOP 100 (batch 50)\n"
-        "/status → Bot status"
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🟢 Bot aktif\n"
-        "Mode: Scanner\n"
-        "TF: 5m\n"
-        "EMA: 150 / 200\n"
-        "Top Volume: 100 (batch 50)"
-    )
-
 async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Scan TOP 100 Volume dimulai...")
+    if context.application.bot_data.get("scanning"):
+        await update.message.reply_text("⛔ Scan masih berjalan...")
+        return
 
-    symbols = get_top_volume_symbols(TOP_N)
+    context.application.bot_data["scanning"] = True
+    await ensure_markets()
 
-    batch1 = symbols[:BATCH_SIZE]
-    batch2 = symbols[BATCH_SIZE:TOP_N]
+    try:
+        await update.message.reply_text("🔍 Scan TOP 100 dimulai...")
 
-    ema150_1, ema200_1 = await scan_batch(batch1, 1)
+        symbols = get_top_volume_symbols(TOP_N)
+        batch1 = symbols[:BATCH_SIZE]
+        batch2 = symbols[BATCH_SIZE:]
 
-    await update.message.reply_text("⏳ Batch 1 selesai, lanjut Batch 2...")
-    await asyncio.sleep(DELAY_BETWEEN_BATCH)
+        ema150_1, ema200_1 = await scan_batch(batch1, 1)
+        await asyncio.sleep(DELAY_BETWEEN_BATCH)
+        ema150_2, ema200_2 = await scan_batch(batch2, 2)
 
-    ema150_2, ema200_2 = await scan_batch(batch2, 2)
+        ema150 = sorted(set(ema150_1 + ema150_2))
+        ema200 = sorted(set(ema200_1 + ema200_2))
 
-    ema150 = sorted(set(ema150_1 + ema150_2))
-    ema200 = sorted(set(ema200_1 + ema200_2))
+        msg = (
+            "🔍 *EMA TOUCH SCANNER – TOP 100*\n"
+            f"TF: {TF}\n\n"
+            "✅ *EMA150 TOUCH:*\n"
+            + ("\n".join(ema150) if ema150 else "- None") +
+            "\n\n✅ *EMA200 TOUCH:*\n"
+            + ("\n".join(ema200) if ema200 else "- None") +
+            f"\n\n⏱ {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
+        )
 
-    msg = (
-        "🔍 *EMA TOUCH SCANNER – TOP 100*\n"
-        f"TF: {TF}\n\n"
-        "✅ *EMA150 TOUCH:*\n"
-        + ("\n".join(ema150) if ema150 else "- None") +
-        "\n\n✅ *EMA200 TOUCH:*\n"
-        + ("\n".join(ema200) if ema200 else "- None") +
-        f"\n\n⏱ {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
-    )
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    finally:
+        context.application.bot_data["scanning"] = False
 
 # ================= INIT ===================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("scan", scan))
-
-    log.info("EMA TOUCH SCANNER TOP100 RUNNING")
+    log.info("EMA TOUCH SCANNER RUNNING")
     app.run_polling(stop_signals=None)
 
 if __name__ == "__main__":
