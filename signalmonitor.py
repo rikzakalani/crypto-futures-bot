@@ -1,312 +1,278 @@
 import ccxt
 import pandas as pd
-import mplfinance as mpf
-import matplotlib
-matplotlib.use("Agg")
-
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    Application
-)
-
-from datetime import datetime, timezone
 import asyncio
 import os
 import logging
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from datetime import datetime, timezone
 
 # ================= LOGGING =================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log", encoding="utf-8")
-    ]
 )
-log = logging.getLogger("MEXC-EMA")
+log = logging.getLogger("EMA-SCANNER")
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TARGET = int(os.getenv("TARGET", "0"))
 
-if not BOT_TOKEN or TARGET == 0:
-    log.error("BOT_TOKEN / TARGET belum diset")
-    exit(1)
+TF_LTF = "5m"
+TF_HTF_1 = "15m"
+TF_HTF_2 = "1h"
 
-TF = "5m"
 FETCH_LIMIT = 300
-PLOT_CANDLE = 120
-SEND_DELAY = 2
-SIGNAL_COOLDOWN = 300
 
 EMA_FAST = 150
 EMA_SLOW = 200
 EMA_EXTRA = 250
-EMA_SMOOTH = 9
 
-# ================= STATE ==================
-MONITOR_ON = False
-WATCHLIST = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "LINK/USDT:USDT"
-]
+TOLERANCE_PCT = 0.001  # 0.1%
 
-LAST_SIGNAL = {}
-TOUCH_MEMORY = {}
+# 🔥 ACTIVE MARKET FILTER (WINRATE FILTER)
+MIN_RANGE_PCT = 0.003
+MIN_BODY_PCT  = 0.0015
 
-# ================= EXCHANGE ===============
+# 🔥 EMA SLOPE FILTER (ANTI FLAT)
+MIN_EMA_SLOPE = 0.0002   # 0.02%
+
+TOP_N = 200
+BATCH_SIZE = 50
+TOTAL_BATCH = 4
+
+DELAY_BETWEEN_BATCH = 30
+DELAY_PER_SYMBOL = 1
+
+DEBUG = False  # 🔧 TRUE kalau mau lihat log detail
+
+# ================= EXCHANGE =================
 exchange = ccxt.mexc({
     "enableRateLimit": True,
     "options": {"defaultType": "swap"}
 })
-exchange.load_markets()
 
-def symbol_available(symbol):
-    return symbol in exchange.markets and exchange.markets[symbol].get("swap")
+MARKETS_LOADED = False
 
-# ================= SAFE FETCH ==============
-async def safe_fetch(symbol):
+async def ensure_markets():
+    global MARKETS_LOADED
+    if not MARKETS_LOADED:
+        await asyncio.get_running_loop().run_in_executor(
+            None, exchange.load_markets
+        )
+        MARKETS_LOADED = True
+
+# ================= SAFE FETCH =================
+async def safe_fetch(symbol, tf):
+    loop = asyncio.get_running_loop()
     for i in range(3):
         try:
-            return exchange.fetch_ohlcv(symbol, TF, limit=FETCH_LIMIT)
+            return await loop.run_in_executor(
+                None,
+                lambda: exchange.fetch_ohlcv(symbol, tf, limit=FETCH_LIMIT)
+            )
         except Exception as e:
-            log.warning(f"Fetch {symbol} retry {i+1}: {e}")
+            log.warning(f"Fetch {symbol} {tf} retry {i+1}: {e}")
             await asyncio.sleep(2)
     return None
 
-# ================= EMA =====================
-def mexc_ema(series, length, smooth=9):
-    ema = series.ewm(span=length, adjust=False).mean()
-    return ema.rolling(smooth).mean()
-
+# ================= EMA =================
 def calc_ema(df):
-    df["ema150"] = mexc_ema(df["close"], EMA_FAST, EMA_SMOOTH)
-    df["ema200"] = mexc_ema(df["close"], EMA_SLOW, EMA_SMOOTH)
-    df["ema250"] = mexc_ema(df["close"], EMA_EXTRA, EMA_SMOOTH)
+    df["ema150"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df["ema250"] = df["close"].ewm(span=EMA_EXTRA, adjust=False).mean()
     return df
 
-# ================= TOUCH ===================
-def ema_touch(df):
-    c = df.iloc[-2]
-    tol = c.close * 0.0003
+# ================= TREND & SLOPE =================
+def ema_slope_ok(series):
+    slope = (series.iloc[-2] - series.iloc[-5]) / series.iloc[-5]
+    return abs(slope) >= MIN_EMA_SLOPE
 
-    for ema in ["ema150", "ema200", "ema250"]:
-        if abs(c.low - c[ema]) <= tol or abs(c.high - c[ema]) <= tol:
-            return ema.upper()
+# ================= HTF BIAS =================
+async def get_htf_bias(symbol):
+    df15 = await safe_fetch(symbol, TF_HTF_1)
+    df1h = await safe_fetch(symbol, TF_HTF_2)
+
+    if not df15 or not df1h:
+        return None
+
+    df15 = pd.DataFrame(df15, columns=["t","o","h","l","c","v"])
+    df1h = pd.DataFrame(df1h, columns=["t","o","h","l","c","v"])
+
+    df15["ema200"] = df15["c"].ewm(span=200, adjust=False).mean()
+    df1h["ema200"] = df1h["c"].ewm(span=200, adjust=False).mean()
+
+    c15 = df15.iloc[-2]
+    c1h = df1h.iloc[-2]
+
+    if c15.c > c15.ema200 and c1h.c > c1h.ema200:
+        return "Bullish"
+    if c15.c < c15.ema200 and c1h.c < c1h.ema200:
+        return "Bearish"
+
     return None
 
-# ================= POST TOUCH ANALYSIS =====
-def evaluate_post_touch(df, memory):
-    try:
-        idx = df.index.get_loc(memory["index"])
-    except KeyError:
-        return None
+# ================= TOP VOLUME =================
+def get_top_volume_symbols(n):
+    tickers = exchange.fetch_tickers()
+    symbols = [
+        (s, t["quoteVolume"])
+        for s, t in tickers.items()
+        if s.endswith("/USDT:USDT") and t and t.get("quoteVolume")
+    ]
+    symbols.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in symbols[:n]]
 
-    if idx + 3 >= len(df):
-        return None
+# ================= SCAN CORE =================
+async def scan_batch(symbols, batch_no, stats):
+    ema150, ema200, ema250 = [], [], []
 
-    base = memory["price"]
-    ema_col = memory["ema"].lower()
-    retouch = False
+    for idx, sym in enumerate(symbols, 1):
+        log.info(f"[Batch {batch_no}] {sym} ({idx}/{len(symbols)})")
 
-    for i in range(1, 4):
-        c = df.iloc[idx + i]
-        tol = c.close * 0.0003
-        if abs(c.low - c[ema_col]) <= tol or abs(c.high - c[ema_col]) <= tol:
-            retouch = True
+        htf_bias = await get_htf_bias(sym)
+        if not htf_bias:
+            stats["filtered"] += 1
+            continue
 
-    last_close = df.iloc[idx + 3].close
+        ohlcv = await safe_fetch(sym, TF_LTF)
+        if not ohlcv:
+            continue
 
-    if retouch:
-        return "RETOUCH"
-    if last_close > base:
-        return "UP"
-    if last_close < base:
-        return "DOWN"
-    return "FLAT"
+        df = pd.DataFrame(
+            ohlcv,
+            columns=["time","open","high","low","close","volume"]
+        )
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+        df.set_index("time", inplace=True)
 
-# ================= SEND SIGNAL =============
-async def send_signal(app, symbol, text, df):
-    key = f"{symbol}_{text}"
-    now = datetime.now(timezone.utc).timestamp()
+        if len(df) < EMA_EXTRA + 5:
+            continue
 
-    if now - LAST_SIGNAL.get(key, 0) < SIGNAL_COOLDOWN:
+        df = calc_ema(df)
+        c = df.iloc[-2]
+        tol = c.close * TOLERANCE_PCT
+
+        # ACTIVE CANDLE FILTER
+        range_pct = (c.high - c.low) / c.close
+        body_pct = abs(c.close - c.open) / c.close
+
+        if range_pct < MIN_RANGE_PCT or body_pct < MIN_BODY_PCT:
+            stats["filtered"] += 1
+            continue
+
+        # EMA SLOPE FILTER
+        if not ema_slope_ok(df["ema200"]):
+            stats["filtered"] += 1
+            continue
+
+        trend = "Bullish 📈" if c.ema150 > c.ema200 else "Bearish 📉"
+
+        # 🚫 NO COUNTERTREND
+        if htf_bias not in trend:
+            stats["filtered"] += 1
+            continue
+
+        stats["scanned"] += 1
+        stats["bullish" if "Bullish" in trend else "bearish"] += 1
+
+        base = sym.split("/")[0]
+
+        if c.low - tol <= c.ema150 <= c.high + tol:
+            ema150.append(f"{base} ({trend})")
+            stats["ema150"] += 1
+
+        if c.low - tol <= c.ema200 <= c.high + tol:
+            ema200.append(f"{base} ({trend})")
+            stats["ema200"] += 1
+
+        if c.low - tol <= c.ema250 <= c.high + tol:
+            ema250.append(f"{base} ({trend})")
+            stats["ema250"] += 1
+
+        if DEBUG:
+            log.info(f"{sym} PASS | {trend} | HTF {htf_bias}")
+
+        await asyncio.sleep(DELAY_PER_SYMBOL)
+
+    return ema150, ema200, ema250
+
+# ================= COMMANDS =================
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.application.bot_data.get("scanning"):
+        await update.message.reply_text("⛔ Scan masih berjalan")
         return
 
-    LAST_SIGNAL[key] = now
+    context.application.bot_data["scanning"] = True
+    await ensure_markets()
 
-    fname = symbol.replace("/", "").replace(":", "") + ".png"
-    plot_df = df.iloc[-PLOT_CANDLE-1:-1]
+    stats = {
+        "scanned": 0,
+        "ema150": 0,
+        "ema200": 0,
+        "ema250": 0,
+        "bullish": 0,
+        "bearish": 0,
+        "filtered": 0,
+    }
 
-    mpf.plot(
-        plot_df,
-        type="candle",
-        style="charles",
-        volume=True,
-        addplot=[
-            mpf.make_addplot(plot_df["ema150"], color="orange"),
-            mpf.make_addplot(plot_df["ema200"], color="red"),
-            mpf.make_addplot(plot_df["ema250"], color="purple"),
-        ],
-        title=f"{symbol} | {text}",
-        savefig=dict(fname=fname, dpi=130)
-    )
-
-    caption = (
-        f"🚨 *EMA TOUCH SIGNAL*\n"
-        f"{symbol}\n"
-        f"{text}\n"
-        f"TF 5m\n"
-        f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
-    )
-
-    with open(fname, "rb") as img:
-        await app.bot.send_photo(
-            chat_id=TARGET,
-            photo=img,
-            caption=caption,
+    try:
+        await update.message.reply_text(
+            "🔍 *EMA TOUCH SCAN FINAL*\n"
+            "• TF Entry : 5m\n"
+            "• HTF Bias : 15m + 1h\n"
+            "• Trend Only (NO Countertrend)\n"
+            "• High Winrate Mode\n\n"
+            "⏳ Scanning...",
             parse_mode="Markdown"
         )
 
-    os.remove(fname)
+        symbols = get_top_volume_symbols(TOP_N)
+        batches = [symbols[i:i+BATCH_SIZE] for i in range(0, TOP_N, BATCH_SIZE)]
 
-# ================= LOOP ====================
-async def monitor_loop(app):
-    log.info("Monitor loop started")
-    while True:
-        if not MONITOR_ON:
-            await asyncio.sleep(5)
-            continue
+        ema150_all, ema200_all, ema250_all = [], [], []
 
-        for sym in WATCHLIST:
-            ohlcv = await safe_fetch(sym)
-            if not ohlcv:
-                continue
+        for i, batch in enumerate(batches, 1):
+            e150, e200, e250 = await scan_batch(batch, i, stats)
+            ema150_all += e150
+            ema200_all += e200
+            ema250_all += e250
+            if i < TOTAL_BATCH:
+                await asyncio.sleep(DELAY_BETWEEN_BATCH)
 
-            df = pd.DataFrame(
-                ohlcv,
-                columns=["time","open","high","low","close","volume"]
-            )
-            df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-            df.set_index("time", inplace=True)
+        msg = (
+            "🔍 *EMA TOUCH SCANNER – FINAL*\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "📈 *EMA150*\n"
+            "━━━━━━━━━━━━━━\n"
+            + ("\n".join(sorted(set(ema150_all))) if ema150_all else "- None") +
+            "\n\n━━━━━━━━━━━━━━\n"
+            "📉 *EMA200*\n"
+            "━━━━━━━━━━━━━━\n"
+            + ("\n".join(sorted(set(ema200_all))) if ema200_all else "- None") +
+            "\n\n━━━━━━━━━━━━━━\n"
+            "🟣 *EMA250*\n"
+            "━━━━━━━━━━━━━━\n"
+            + ("\n".join(sorted(set(ema250_all))) if ema250_all else "- None") +
+            "\n\n━━━━━━━━━━━━━━\n"
+            "📊 *STAT*\n"
+            f"• Scanned  : {stats['scanned']}\n"
+            f"• Filtered : {stats['filtered']}\n"
+            f"• Bullish  : {stats['bullish']}\n"
+            f"• Bearish  : {stats['bearish']}\n"
+            f"\n🕒 {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
+        )
 
-            if len(df) < EMA_EXTRA + EMA_SMOOTH + 5:
-                continue
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
-            df = calc_ema(df)
+    finally:
+        context.application.bot_data["scanning"] = False
 
-            # DEBUG SCAN (lihat bot bergerak)
-            log.info(f"SCAN {sym} | candle {df.index[-2]}")
-
-            touch = ema_touch(df)
-
-            if touch and sym not in TOUCH_MEMORY:
-                TOUCH_MEMORY[sym] = {
-                    "ema": touch,
-                    "index": df.index[-2],
-                    "price": df.iloc[-2].close
-                }
-                await send_signal(app, sym, f"{touch} TOUCH", df)
-
-            if sym in TOUCH_MEMORY:
-                result = evaluate_post_touch(df, TOUCH_MEMORY[sym])
-                if result:
-                    await send_signal(
-                        app,
-                        sym,
-                        f'{TOUCH_MEMORY[sym]["ema"]} → {result}',
-                        df
-                    )
-                    del TOUCH_MEMORY[sym]
-
-            await asyncio.sleep(SEND_DELAY)
-
-# ================= COMMANDS ================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 EMA TOUCH BOT (MEXC)\n\n"
-        "/on /off\n"
-        "/addcoin btc\n"
-        "/delcoin btc\n"
-        "/listcoin\n"
-        "/status"
-    )
-
-async def on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MONITOR_ON
-    MONITOR_ON = True
-    await update.message.reply_text("🟢 Monitor ON")
-
-async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MONITOR_ON
-    MONITOR_ON = False
-    await update.message.reply_text("🔴 Monitor OFF")
-
-async def addcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❗ Gunakan: /addcoin btc")
-        return
-
-    sym = f"{context.args[0].upper()}/USDT:USDT"
-
-    if not symbol_available(sym):
-        await update.message.reply_text("❌ Symbol tidak tersedia")
-        return
-
-    if sym in WATCHLIST:
-        await update.message.reply_text("⚠️ Symbol sudah ada")
-        return
-
-    WATCHLIST.append(sym)
-    await update.message.reply_text(f"✅ {sym} added")
-
-async def delcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❗ Gunakan: /delcoin btc")
-        return
-
-    sym = f"{context.args[0].upper()}/USDT:USDT"
-
-    if sym not in WATCHLIST:
-        await update.message.reply_text("⚠️ Symbol tidak ada")
-        return
-
-    WATCHLIST.remove(sym)
-    await update.message.reply_text(f"🗑️ {sym} removed")
-
-async def listcoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("\n".join(WATCHLIST))
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Monitor: {MONITOR_ON}\nCoins: {len(WATCHLIST)}"
-    )
-
-# ================= INIT ====================
-async def post_init(app: Application):
-    app.create_task(monitor_loop(app))
-
+# ================= INIT =================
 def main():
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("on", on_cmd))
-    app.add_handler(CommandHandler("off", off_cmd))
-    app.add_handler(CommandHandler("addcoin", addcoin))
-    app.add_handler(CommandHandler("delcoin", delcoin))
-    app.add_handler(CommandHandler("listcoin", listcoin))
-    app.add_handler(CommandHandler("status", status))
-
-    log.info("EMA TOUCH BOT MEXC FINAL RUNNING")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("scan", scan))
+    log.info("EMA TOUCH SCANNER FINAL RUNNING")
     app.run_polling(stop_signals=None)
 
 if __name__ == "__main__":
