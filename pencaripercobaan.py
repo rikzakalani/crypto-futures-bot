@@ -30,7 +30,13 @@ FETCH_LIMIT = 300
 
 EMA_FAST = 150
 EMA_SLOW = 200
+EMA_EXTRA = 250   # ✅ EMA250
+
 TOLERANCE_PCT = 0.001  # 0.1%
+
+# 🔥 FILTER KOIN YANG BERGERAK
+MIN_RANGE_PCT = 0.003   # 0.3% candle range
+MIN_BODY_PCT  = 0.0015  # 0.15% candle body
 
 TOP_N = 200
 BATCH_SIZE = 50
@@ -73,6 +79,7 @@ async def safe_fetch(symbol):
 def calc_ema(df):
     df["ema150"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema200"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df["ema250"] = df["close"].ewm(span=EMA_EXTRA, adjust=False).mean()
     return df
 
 # ================= TOP VOLUME =============
@@ -93,7 +100,7 @@ def get_top_volume_symbols(n):
 
 # ================= SCAN CORE ==============
 async def scan_batch(symbols, batch_no, stats):
-    ema150, ema200 = [], []
+    ema150, ema200, ema250 = [], [], []
 
     for idx, sym in enumerate(symbols, 1):
         log.info(f"[Batch {batch_no}] {sym} ({idx}/{len(symbols)})")
@@ -109,12 +116,20 @@ async def scan_batch(symbols, batch_no, stats):
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         df.set_index("time", inplace=True)
 
-        if len(df) < EMA_SLOW + 2:
+        if len(df) < EMA_EXTRA + 2:
             continue
 
         df = calc_ema(df)
         c = df.iloc[-2]
         tol = c.close * TOLERANCE_PCT
+
+        # 🔥 FILTER KOIN YANG BERGERAK
+        range_pct = (c.high - c.low) / c.close
+        body_pct = abs(c.close - c.open) / c.close
+
+        if range_pct < MIN_RANGE_PCT or body_pct < MIN_BODY_PCT:
+            stats["filtered"] += 1
+            continue
 
         trend = "Bullish 📈" if c.ema150 > c.ema200 else "Bearish 📉"
         stats["scanned"] += 1
@@ -130,18 +145,23 @@ async def scan_batch(symbols, batch_no, stats):
             ema200.append(f"{base} ({trend})")
             stats["ema200"] += 1
 
+        if c.low - tol <= c.ema250 <= c.high + tol:
+            ema250.append(f"{base} ({trend})")
+            stats["ema250"] += 1
+
         await asyncio.sleep(DELAY_PER_SYMBOL)
 
-    return ema150, ema200
+    return ema150, ema200, ema250
 
 # ================= COMMANDS UX =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "👋 *Selamat datang di EMA Touch Scanner Bot*\n\n"
-        "📌 Fungsi:\n"
+        "📌 Fitur:\n"
         "• Scan Futures MEXC\n"
         "• TF 5 Menit\n"
-        "• EMA150 & EMA200 Touch\n"
+        "• EMA150 / EMA200 / EMA250 Touch\n"
+        "• Filter koin aktif\n"
         "• TOP 200 Volume\n\n"
         "📊 Cocok untuk Scalping & Pullback\n\n"
         "Ketik /help untuk panduan"
@@ -151,13 +171,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "📘 *PANDUAN BOT*\n\n"
-        "🔹 /scan\n"
-        "Mulai scan EMA Touch TOP 200\n\n"
-        "🔹 /status\n"
-        "Cek status bot\n\n"
+        "🔹 /scan → Mulai scan EMA Touch\n"
+        "🔹 /status → Status bot\n\n"
         "📈 TREND:\n"
-        "Bullish → EMA150 di atas EMA200\n"
-        "Bearish → EMA150 di bawah EMA200\n\n"
+        "Bullish → EMA150 > EMA200\n"
+        "Bearish → EMA150 < EMA200\n\n"
         "⚠️ Gunakan money management"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -181,8 +199,10 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "scanned": 0,
         "ema150": 0,
         "ema200": 0,
+        "ema250": 0,
         "bullish": 0,
         "bearish": 0,
+        "filtered": 0,
     }
 
     try:
@@ -190,21 +210,22 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔍 *EMA TOUCH SCAN DIMULAI*\n\n"
             "• Exchange : MEXC Futures\n"
             "• TF       : 5m\n"
-            "• Volume   : TOP 200\n"
-            "• Batch    : 4\n\n"
-            "⏳ Mohon tunggu ± 3–4 menit...",
+            "• EMA      : 150 / 200 / 250\n"
+            "• Volume   : TOP 200\n\n"
+            "⏳ Mohon tunggu...",
             parse_mode="Markdown"
         )
 
         symbols = get_top_volume_symbols(TOP_N)
         batches = [symbols[i:i+BATCH_SIZE] for i in range(0, TOP_N, BATCH_SIZE)]
 
-        ema150_all, ema200_all = [], []
+        ema150_all, ema200_all, ema250_all = [], [], []
 
         for i, batch in enumerate(batches, 1):
-            e150, e200 = await scan_batch(batch, i, stats)
+            e150, e200, e250 = await scan_batch(batch, i, stats)
             ema150_all += e150
             ema200_all += e200
+            ema250_all += e250
             if i < TOTAL_BATCH:
                 await asyncio.sleep(DELAY_BETWEEN_BATCH)
 
@@ -220,11 +241,17 @@ async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━\n"
             + ("\n".join(sorted(set(ema200_all))) if ema200_all else "- None") +
             "\n\n━━━━━━━━━━━━━━\n"
+            "🟣 *EMA250 TOUCH*\n"
+            "━━━━━━━━━━━━━━\n"
+            + ("\n".join(sorted(set(ema250_all))) if ema250_all else "- None") +
+            "\n\n━━━━━━━━━━━━━━\n"
             "📊 *STATISTIK SCAN*\n"
             "━━━━━━━━━━━━━━\n"
             f"• Total Scanned : {stats['scanned']}\n"
             f"• EMA150 Touch : {stats['ema150']}\n"
             f"• EMA200 Touch : {stats['ema200']}\n"
+            f"• EMA250 Touch : {stats['ema250']}\n"
+            f"• Filtered     : {stats['filtered']}\n"
             f"• Bullish      : {stats['bullish']}\n"
             f"• Bearish      : {stats['bearish']}\n"
             f"\n🕒 {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}"
