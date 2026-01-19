@@ -3,7 +3,7 @@ Description=Market Sense Scanner Bot
 After=network.target
 
 [Service]
-User=root@iZk1aft1w95287azxeyxkvZ:
+User=root
 WorkingDirectory=/home/root
 ExecStart=/usr/bin/python3 /home/root:/final.py
 Restart=always
