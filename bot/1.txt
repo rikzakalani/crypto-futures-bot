@@ -1,14 +1,36 @@
+sudo nano /etc/systemd/system/marketscanner.service
+ISI PAKAI INI (FULL, COPY PASTE) ⬇️
+
 [Unit]
 Description=Market Sense Scanner Bot
 After=network.target
 
 [Service]
 User=root
-WorkingDirectory=/home/root
-ExecStart=/usr/bin/python3 /home/root:/final.py
+WorkingDirectory=/root/crypto-futures-bot
+ExecStart=/usr/bin/python3 /root/crypto-futures-bot/final.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
+📌 Catatan penting:
+
+WorkingDirectory → FOLDER
+
+ExecStart → FILE
+
+jangan pakai : atau path aneh
+
+2️⃣ RELOAD SYSTEMD (WAJIB)
+Jalankan URUT:
+
+sudo systemctl daemon-reexec
+sudo systemctl daemon-reload
+sudo systemctl restart marketscanner
+3️⃣ CEK STATUS
+sudo systemctl status marketscanner
+🎯 TARGET OUTPUT:
+
+Active: active (running)
